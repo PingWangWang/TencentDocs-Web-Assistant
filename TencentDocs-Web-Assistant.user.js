@@ -1,13 +1,14 @@
 // ==UserScript==
 // @name         Tencent Docs Web Assistant — 腾讯文档Web助手
 // @namespace    https://github.com/PingWangWang
-// @version      1.5.1
-// @description  腾讯文档网页增强助手：①桌面版(desktop)左侧目录栏可拖拽调宽，内层目录自适应不截断文字；②文档页(doc)左侧大纲面板可拖拽调宽，正文内容同步右移不遮挡；③宽度自动记忆，双击分隔条恢复默认；④右下角齿轮悬浮按钮打开设置面板，可一键开关"自动关闭 AI 助手面板"，点击立即生效；齿轮可自由拖动摆放（位置自动记忆），避免遮挡内容。
+// @version      1.6.3
+// @description  腾讯文档网页增强助手：①桌面版(desktop)左侧目录栏可拖拽调宽，内层目录自适应不截断文字；②文档页(doc)左侧大纲面板可拖拽调宽，正文内容同步右移不遮挡；③宽度自动记忆，双击分隔条恢复默认；④右下角齿轮悬浮按钮打开设置面板，可一键开关"自动关闭 AI 助手面板"，点击立即生效；齿轮可自由拖动摆放（位置自动记忆），避免遮挡内容；⑤主题切换：浅色/深色/护眼（豆沙绿）三档，即时生效并记忆。
 // @author       PingWangWang
 // @icon         https://docs.qq.com/favicon.ico
 // @match        https://docs.qq.com/desktop/*
 // @match        https://docs.qq.com/home*
 // @match        https://docs.qq.com/doc/*
+// @match        https://docs.qq.com/sheet/*
 // @run-at       document-idle
 // @grant        GM_registerMenuCommand
 // @grant        GM_unregisterMenuCommand
@@ -24,6 +25,7 @@
   var KEY_OUTLINE_W = 'td_outline_width';      // doc 大纲面板宽度
   var KEY_GEAR_POS = 'td_gear_pos';            // 齿轮悬浮按钮位置 {x,y}
   var SETTING_AI = 'td_auto_close_ai';
+  var KEY_THEME = 'td_theme';                // 主题模式：light / dark / sepia
   var GEAR_SIZE = 28;        // 齿轮按钮直径(px)
   var GEAR_MARGIN = 16;      // 默认距视口边缘间距(px)
   var GEAR_DRAG_THRESHOLD = 4; // 超过该位移(px)判定为拖动而非点击
@@ -35,6 +37,18 @@
   var OUTLINE_MAX = 600;
   var HANDLE_W = 8;          // 分隔条命中区域宽度(px)
   var CONTENT_GAP = 12;      // 大纲拉宽后与正文的保证间距(px)
+
+  /********************* 主题定义 *********************/
+  var THEME_ORDER = ['light', 'dark', 'sepia'];
+  var THEMES = {
+    light: { label: '浅色', hint: '官方默认' },
+    dark:  { label: '深色', hint: '夜间反色' },
+    sepia: { label: '护眼', hint: '豆沙绿' }
+  };
+  var DEFAULT_THEME = 'light';
+  var THEME_STYLE_ID = 'td-theme-style';
+  var THEME_OVERLAY_ID = 'td-theme-overlay';
+  var SEPIA_COLOR = '#c7edcc';   // 护眼豆沙绿
 
   /********************* 工具 *********************/
   function $(sel, root) { return (root || document).querySelector(sel); }
@@ -62,13 +76,19 @@
   function setAutoCloseAi(on) { store.set(SETTING_AI, on ? '1' : '0'); refreshMenu(); }
 
   var menuId = null;
+  var themeMenuId = null;
   function refreshMenu() {
     var label = '⚙️ 设置：自动关闭右侧 AI 助手面板（当前：' + (getAutoCloseAi() ? '开启' : '关闭') + '）';
+    var themeLabel = '🎨 主题：切换为「' + THEMES[nextTheme()].label + '」（当前：' + THEMES[getTheme()].label + '）';
     try {
       if (typeof GM_registerMenuCommand !== 'function') return;
       if (menuId !== null && typeof GM_unregisterMenuCommand === 'function') GM_unregisterMenuCommand(menuId);
       menuId = GM_registerMenuCommand(label, function () {
         applyAutoCloseAi(!getAutoCloseAi());
+      });
+      if (themeMenuId !== null && typeof GM_unregisterMenuCommand === 'function') GM_unregisterMenuCommand(themeMenuId);
+      themeMenuId = GM_registerMenuCommand(themeLabel, function () {
+        setTheme(nextTheme());   // 浅色 → 深色 → 护眼 → 浅色 循环
       });
     } catch (e) { /* 非油猴环境忽略 */ }
   }
@@ -227,11 +247,11 @@
         store.del(KEY_DESKTOP_W);
       }
     });
-    document.body.appendChild(handle);
+    document.documentElement.appendChild(handle);
 
     var rafTimer = null;
     var loop = function () {
-      if (!document.body.contains(handle) || !document.body.contains(sidebar)) {
+      if (!document.documentElement.contains(handle) || !document.documentElement.contains(sidebar)) {
         cancelAnimationFrame(rafTimer);
         if (handle.parentNode) handle.parentNode.removeChild(handle);
         setTimeout(start, 1000);
@@ -283,7 +303,15 @@
            document.querySelector('[class*="melo-doc-view"]');
   }
 
-  /** 让正文纸面右移，保证不与拉宽后的大纲重叠（tick 内每帧自校正） */
+  /**
+   * 正文列定位（v1.6.2 起默认居中）：
+   *  - 内容列比「大纲右缘 ~ 滚动区右缘」的可见区域窄 → 在该区域内水平居中，
+   *    不再紧挨目录右侧、右侧留大片空白；
+   *  - 内容列过宽放不下 → 退回原防遮挡逻辑（左缘 = 大纲右缘 + CONTENT_GAP）。
+   * 仍走增量控制器（增益 1 + ±2px 死区）：padding→纸面位移系数 0<s≤1 时
+   * 单调收敛（增益 2 在 s=1 实站会振荡，实测踩坑），目标从「防遮挡线」
+   * 换成「居中线」不改变收敛性质。
+   */
   function syncContentShift(drawer) {
     var scroller = findEditorScroller();
     var paper = findPaper();
@@ -291,13 +319,21 @@
     var dr = drawer.getBoundingClientRect();
     var pr = paper.getBoundingClientRect();
     if (dr.width === 0 || pr.width === 0) return;
-    var need = dr.right + CONTENT_GAP - pr.x;      // >0 表示需要右移
+    // 右边界用 clientWidth：剔除滚动条宽度，居中不受其影响
+    var rightEdge = scroller.getBoundingClientRect().left + scroller.clientWidth;
+    var visibleL = dr.right + CONTENT_GAP;          // 可见区域左缘（含安全间距）
+    var visibleW = rightEdge - visibleL;            // 可见区域宽度
+    if (visibleW <= 0) return;
+    var targetX;
+    if (pr.width < visibleW - 2 * CONTENT_GAP) {
+      targetX = visibleL + (visibleW - pr.width) / 2;   // 居中
+    } else {
+      targetX = visibleL;                                // 过宽：仅保证不遮挡
+    }
+    var need = targetX - pr.x;                     // >0 需右移，<0 需左移
     if (Math.abs(need) <= 2) return;               // 死区防抖
-    // 增量控制，增益 1：pad_new = cur + need。实测 padding→纸面位移系数
-    // 在 0.5~1 之间（不同布局状态下不同），增益 1 对任意 0<s<=1 都单调收敛；
-    // 增益 2 在 s=1 时（实站）会陷入 ±2*need 的周期振荡（实测踩坑）
     var cur = parseInt(scroller.style.getPropertyValue('padding-left'), 10) || 0;
-    var pad = Math.max(0, Math.min(1200, Math.round(cur + need)));
+    var pad = Math.max(0, Math.min(2400, Math.round(cur + need)));
     if (pad !== cur) scroller.style.setProperty('padding-left', pad + 'px', 'important');
   }
 
@@ -346,7 +382,7 @@
         docTick();
       }
     });
-    document.body.appendChild(handle);
+    document.documentElement.appendChild(handle);
 
     function docTick() {
       var d = findOutlineDrawer();
@@ -355,8 +391,8 @@
       if (parseInt(d.style.width, 10) !== docState.curW) applyOutlineWidth(d, docState.curW);
       syncHandle(d, handle);
       syncContentShift(d);
-      if (!document.body.contains(handle)) {
-        document.body.appendChild(handle); // handle 被清理时自动补挂
+      if (!document.documentElement.contains(handle)) {
+        document.documentElement.appendChild(handle); // handle 被清理时自动补挂
       }
     }
     docTick();
@@ -467,6 +503,106 @@
     }, 1000);
   }
 
+  /********************* 主题模式：浅色 / 深色 / 护眼 *********************/
+  /**
+   * 实现要点（踩坑记录）：
+   * 1. 深色：给 body 加 invert(1) hue-rotate(180deg) 滤镜（Dark Reader 同类做法），
+   *    照片类媒体(img/video/picture)再反向还原一次避免偏色；iframe/embed/object
+   *    整帧反色；canvas 刻意不还原（腾讯文档 Word 正文 / Excel 表格画在 canvas
+   *    上，且 canvas 背景透明——还原会让黑字贴在被反黑的白纸面上不可读）。
+   * 2. 护眼：不用 hue-rotate（会把蓝色链接转成紫红），改用一层
+   *    豆沙绿 #c7edcc 的 mix-blend-mode:multiply 蒙层：白底 → 正豆沙绿、
+   *    黑字保持黑、蓝字仍偏蓝，色相保留最自然。
+   * 3. 关键：filter 会让该元素成为 position:fixed 后代的包含块，导致 fixed
+   *    定位漂移。因此脚本自身 UI（齿轮 / 设置卡片 / 分隔条）统一挂到
+   *    documentElement（body 的兄弟节点），不落入 body 滤镜范围 —— 既保持
+   *    原色，也完全不受包含块变化影响，无需任何坐标补偿。
+   * 4. 蒙层 z-index(2147482000) 低于脚本 UI(2147483000+)，故脚本 UI 不被着色。
+   */
+  function getTheme() {
+    var t = store.get(KEY_THEME);
+    return THEMES[t] ? t : DEFAULT_THEME;
+  }
+
+  function nextTheme() {
+    var i = THEME_ORDER.indexOf(getTheme());
+    if (i < 0) i = 0;
+    return THEME_ORDER[(i + 1) % THEME_ORDER.length];
+  }
+
+  function setTheme(t) {
+    if (!THEMES[t]) t = DEFAULT_THEME;
+    store.set(KEY_THEME, t);
+    applyTheme();
+    refreshMenu();
+  }
+
+  function ensureThemeStyle() {
+    if (document.getElementById(THEME_STYLE_ID)) return;
+    var css = [
+      /* ---- 深色：body 整体反色，html 背景同步变深避免透明区域漏白 ---- */
+      'html.td-theme-dark{background:#14161a !important;}',
+      'html.td-theme-dark > body{filter:invert(1) hue-rotate(180deg) !important;}',
+      // iframe / embed / object 整帧反色（doc/sheet 正文若渲染在 iframe 内也能覆盖）
+      'html.td-theme-dark > body iframe,html.td-theme-dark > body embed,' +
+      'html.td-theme-dark > body object{filter:invert(1) hue-rotate(180deg) !important;}',
+      // 仅照片类媒体反向还原。注意 canvas 刻意不还原：
+      // 腾讯文档 Word 正文 / Excel 表格都画在 canvas 上，还原会让文字保持黑色，
+      // 而父级白纸面被反成黑底 → 黑字黑底不可读（v1.6.1 踩坑修复）
+      'html.td-theme-dark > body img,html.td-theme-dark > body video,' +
+      'html.td-theme-dark > body picture{filter:invert(1) hue-rotate(180deg) !important;}',
+
+      /* ---- 护眼：豆沙绿 multiply 蒙层 ---- */
+      'html.td-theme-sepia{background:' + SEPIA_COLOR + ' !important;}',
+      '#' + THEME_OVERLAY_ID + '{position:fixed;top:0;left:0;width:100%;height:100%;' +
+      'pointer-events:none;z-index:2147482000;background:' + SEPIA_COLOR + ';mix-blend-mode:multiply;}',
+
+      /* ---- 深色模式下脚本自身 UI 同步换肤（挂在 html 下，不进 body 滤镜） ---- */
+      'html.td-theme-dark #td-rz-gear{background:rgba(45,48,54,.92);border-color:#4a4e56;' +
+      'box-shadow:0 2px 8px rgba(0,0,0,.5);}',
+      'html.td-theme-dark #td-rz-gear svg{fill:#c8ccd2;}',
+      'html.td-theme-dark #td-rz-settings{background:#2a2d33;color:#e6e8eb;' +
+      'border-color:#3a3e45;box-shadow:0 6px 24px rgba(0,0,0,.5);}',
+      'html.td-theme-dark #td-rz-settings .td-rz-title{color:#e6e8eb;}',
+      'html.td-theme-dark #td-rz-settings .td-rz-row:hover{background:#343841;}',
+      'html.td-theme-dark #td-rz-settings .td-rz-label{color:#e6e8eb;}',
+      'html.td-theme-dark #td-rz-settings .td-rz-divider{background:#3a3e45;}',
+      'html.td-theme-dark #td-rz-settings .td-rz-footer{color:#8b919c;}',
+      'html.td-theme-dark #td-rz-settings .td-rz-seg{border-color:#4a4e56;}',
+      'html.td-theme-dark #td-rz-settings .td-rz-seg-btn{background:#2a2d33;color:#c8ccd2;}',
+      'html.td-theme-dark #td-rz-settings .td-rz-seg-btn + .td-rz-seg-btn{border-left-color:#4a4e56;}',
+      'html.td-theme-dark #td-rz-settings .td-rz-seg-btn:hover{background:#343841;}',
+      // 选中态必须带 html.td-theme-dark 前缀压过上面的普通态（特异性 1id+3class > 1id+2class+1element），
+      // 否则深色下点选主题后按钮不变蓝（v1.6.1 踩坑修复）
+      'html.td-theme-dark #td-rz-settings .td-rz-seg-btn.td-rz-seg-on,' +
+      'html.td-theme-dark #td-rz-settings .td-rz-seg-btn.td-rz-seg-on:hover' +
+      '{background:#4e83fd !important;color:#fff !important;}'
+    ].join('\n');
+    var style = document.createElement('style');
+    style.id = THEME_STYLE_ID;
+    style.textContent = css;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function applyTheme() {
+    var t = getTheme();
+    var html = document.documentElement;
+    html.classList.remove('td-theme-light', 'td-theme-dark', 'td-theme-sepia');
+    html.classList.add('td-theme-' + t);
+    ensureThemeStyle();
+
+    var ov = document.getElementById(THEME_OVERLAY_ID);
+    if (t === 'sepia') {
+      if (!ov) {
+        ov = document.createElement('div');
+        ov.id = THEME_OVERLAY_ID;
+        html.appendChild(ov);
+      }
+    } else if (ov && ov.parentNode) {
+      ov.parentNode.removeChild(ov);
+    }
+  }
+
   /********************* 设置面板 UI（齿轮按钮 + 弹出卡片） *********************/
   var GEAR_ID = 'td-rz-gear';
   var PANEL_ID = 'td-rz-settings';
@@ -562,7 +698,18 @@
       '#' + PANEL_ID + ' .td-rz-switch.td-rz-on{background:#4e83fd;}',
       '#' + PANEL_ID + ' .td-rz-switch.td-rz-on::after{left:18px;}',
       '#' + PANEL_ID + ' .td-rz-divider{height:1px;background:#f0f1f4;margin:0 14px;}',
-      '#' + PANEL_ID + ' .td-rz-footer{padding:8px 14px 12px;color:#9aa1ac;font-size:12px;line-height:1.6;}'
+      '#' + PANEL_ID + ' .td-rz-footer{padding:8px 14px 12px;color:#9aa1ac;font-size:12px;line-height:1.6;}',
+      /* 主题分段选择器 */
+      '#' + PANEL_ID + ' .td-rz-row.td-rz-theme-row{cursor:default;}',
+      '#' + PANEL_ID + ' .td-rz-row.td-rz-theme-row:hover{background:transparent;}',
+      '#' + PANEL_ID + ' .td-rz-seg{display:flex;flex-shrink:0;margin-left:8px;border:1px solid #e3e6ea;' +
+        'border-radius:8px;overflow:hidden;}',
+      '#' + PANEL_ID + ' .td-rz-seg-btn{border:0;background:#fff;color:#5f6672;font-size:12px;' +
+        'font-family:inherit;line-height:1.4;padding:4px 9px;cursor:pointer;}',
+      '#' + PANEL_ID + ' .td-rz-seg-btn + .td-rz-seg-btn{border-left:1px solid #e3e6ea;}',
+      '#' + PANEL_ID + ' .td-rz-seg-btn:hover{background:#f2f4f7;}',
+      '#' + PANEL_ID + ' .td-rz-seg-btn.td-rz-seg-on{background:#4e83fd;color:#fff;}',
+      '#' + PANEL_ID + ' .td-rz-seg-btn.td-rz-seg-on:hover{background:#4e83fd;}'
     ].join('\n');
     var style = document.createElement('style');
     style.id = GEAR_ID + '-style';
@@ -580,6 +727,15 @@
     panel.id = PANEL_ID;
     panel.innerHTML =
       '<div class="td-rz-title">侧栏助手设置</div>' +
+      '<div class="td-rz-row td-rz-theme-row" id="td-rz-row-theme">' +
+      '  <span class="td-rz-label">主题模式</span>' +
+      '  <span class="td-rz-seg" id="td-rz-theme-seg">' +
+      '    <button type="button" class="td-rz-seg-btn" data-theme="light">浅色</button>' +
+      '    <button type="button" class="td-rz-seg-btn" data-theme="dark">深色</button>' +
+      '    <button type="button" class="td-rz-seg-btn" data-theme="sepia">护眼</button>' +
+      '  </span>' +
+      '</div>' +
+      '<div class="td-rz-divider"></div>' +
       '<div class="td-rz-row" id="td-rz-row-ai">' +
       '  <span class="td-rz-label">自动关闭 AI 助手面板</span>' +
       '  <span class="td-rz-switch" id="td-rz-switch-ai"></span>' +
@@ -592,11 +748,12 @@
       '  <span class="td-rz-label" style="color:#4e83fd;">悬浮按钮回到右下角</span>' +
       '</div>' +
       '<div class="td-rz-footer">拖动侧栏/大纲右边缘调宽 · 双击分隔线也可重置<br>' +
-      '齿轮可自由拖动摆放（位置自动记忆）· 右键齿轮立即复位<br>设置即时生效并自动保存</div>';
+      '齿轮可自由拖动摆放（位置自动记忆）· 右键齿轮立即复位<br>主题三档即时切换 · 设置自动保存</div>';
 
     gear.title = '侧栏助手设置（可拖动摆放 · 右键立即复位）';
-    document.body.appendChild(gear);
-    document.body.appendChild(panel);
+    // 挂在 <html> 下（body 的兄弟）：不落入主题滤镜范围，避免 fixed 定位漂移与自身被反色
+    document.documentElement.appendChild(gear);
+    document.documentElement.appendChild(panel);
 
     // 初始位置：右下角（有记忆则用记忆位置）
     var gearPos = loadGearPos();
@@ -606,9 +763,30 @@
     function renderSwitch() { sw.classList.toggle('td-rz-on', getAutoCloseAi()); }
     renderSwitch();
 
+    var segWrap = panel.querySelector('#td-rz-theme-seg');
+    var segBtns = segWrap.querySelectorAll('.td-rz-seg-btn');
+    function renderTheme() {
+      var cur = getTheme();
+      for (var i = 0; i < segBtns.length; i++) {
+        segBtns[i].classList.toggle('td-rz-seg-on', segBtns[i].getAttribute('data-theme') === cur);
+      }
+    }
+    renderTheme();
+
+    // 主题分段点击：事件委托 + closest 兼容（按钮内无子元素，e.target 即按钮）
+    segWrap.addEventListener('click', function (e) {
+      var btn = e.target;
+      while (btn && btn !== segWrap && !btn.classList.contains('td-rz-seg-btn')) btn = btn.parentNode;
+      if (!btn || btn === segWrap) return;
+      e.stopPropagation();
+      setTheme(btn.getAttribute('data-theme'));
+      renderTheme();
+    });
+
     function openPanel() {
       panel.classList.add('td-rz-open');
       renderSwitch();
+      renderTheme();
       positionPanel(gear, panel);
     }
     function closePanel() { panel.classList.remove('td-rz-open'); }
@@ -727,6 +905,7 @@
     });
 
     panel.__renderSwitch = renderSwitch;
+    panel.__renderTheme = renderTheme;
   }
 
   /** 外部（油猴菜单）切换后同步卡片开关状态 */
@@ -737,11 +916,22 @@
     if (panel && panel.__renderSwitch) panel.__renderSwitch();
   };
 
+  /** 外部（油猴菜单 / 调试钩子）切换主题后同步卡片分段选中态 */
+  var _origSetTheme = setTheme;
+  setTheme = function (t) {
+    _origSetTheme(t);
+    var panel = $('#' + PANEL_ID);
+    if (panel && panel.__renderTheme) panel.__renderTheme();
+  };
+
   /********************* 初始化 + SPA 监听 *********************/
   function isDocPage() { return /^\/doc\//.test(location.pathname); }
+  function isSheetPage() { return /^\/sheet\//.test(location.pathname); }
 
   function mount() {
     if ($('#' + HANDLE_ID)) return true;
+    // 表格页(/sheet/*)无目录栏与大纲面板，跳过侧栏挂载，仅保留主题/齿轮/AI 面板逻辑
+    if (isSheetPage()) return true;
     return isDocPage() ? mountDocOutline() : mountDesktop();
   }
 
@@ -761,6 +951,7 @@
 
   function startAll() {
     start();
+    applyTheme();        // 主题先于 UI 应用，卡片渲染时即为当前主题
     refreshMenu();
     createSettingsUi();
     if (getAutoCloseAi()) aiCloseTick(true);
@@ -770,7 +961,11 @@
   /********************* 调试 / 测试钩子 *********************/
   try {
     window.__tdResize = {
-      version: '1.5.1',
+      version: '1.6.3',
+      themes: THEME_ORDER.slice(),
+      getTheme: getTheme,
+      setTheme: function (t) { setTheme(t); },
+      cycleTheme: function () { setTheme(nextTheme()); },
       getAutoCloseAi: getAutoCloseAi,
       setAutoCloseAi: function (on) { setAutoCloseAi(!!on); if (on) aiCloseTick(true); else restoreAiPanels(); },
       closeAiNow: function () { aiCloseTick(true); },
