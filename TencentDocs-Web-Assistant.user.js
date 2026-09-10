@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tencent Docs Web Assistant — 腾讯文档Web助手
 // @namespace    https://github.com/PingWangWang
-// @version      1.6.4
+// @version      1.6.5
 // @description  腾讯文档网页增强助手：①桌面版(desktop)左侧目录栏可拖拽调宽，内层目录自适应不截断文字；②文档页(doc)左侧大纲面板可拖拽调宽，正文内容同步右移不遮挡；③宽度自动记忆，双击分隔条恢复默认；④右下角齿轮悬浮按钮打开设置面板，可一键开关"自动关闭 AI 助手面板"，点击立即生效；齿轮可自由拖动摆放（位置自动记忆），避免遮挡内容；⑤主题切换：浅色/深色/护眼（豆沙绿）三档，即时生效并记忆。
 // @author       PingWangWang
 // @icon         https://docs.qq.com/favicon.ico
@@ -47,8 +47,9 @@
   };
   var DEFAULT_THEME = 'light';
   var THEME_STYLE_ID = 'td-theme-style';
-  var THEME_OVERLAY_ID = 'td-theme-overlay';
+  var THEME_OVERLAY_ID = 'td-theme-overlay';      // 蒙层容器（内含提亮层/护眼层）
   var SEPIA_COLOR = '#c7edcc';   // 护眼豆沙绿
+  var DARK_LIFT_COLOR = '#1c1f24'; // 深色提亮底色：把反色后的纯黑抬到深灰，避免纯黑刺眼
 
   /********************* 工具 *********************/
   function $(sel, root) { return (root || document).querySelector(sel); }
@@ -510,6 +511,8 @@
    *    照片类媒体(img/video/picture)再反向还原一次避免偏色；iframe/embed/object
    *    整帧反色；canvas 刻意不还原（腾讯文档 Word 正文 / Excel 表格画在 canvas
    *    上，且 canvas 背景透明——还原会让黑字贴在被反黑的白纸面上不可读）。
+   *    反色会把白底变成「纯黑」，对比度过高且刺眼，故再叠一层 screen 深灰提亮层
+   *    把纯黑抬到深灰（#1c1f24 级），白字仍为白，观感更柔和。
    * 2. 护眼：不用 hue-rotate（会把蓝色链接转成紫红），改用一层
    *    豆沙绿 #c7edcc 的 mix-blend-mode:multiply 蒙层：白底 → 正豆沙绿、
    *    黑字保持黑、蓝字仍偏蓝，色相保留最自然。
@@ -540,8 +543,12 @@
   function ensureThemeStyle() {
     if (document.getElementById(THEME_STYLE_ID)) return;
     var css = [
-      /* ---- 深色：body 整体反色，html 背景同步变深避免透明区域漏白 ---- */
-      'html.td-theme-dark{background:#14161a !important;}',
+      /* ---- 深色：body 整体反色，html 背景同步变深避免透明区域漏白 ----
+       * 反色是线性映射：白(255) → 黑(0)，整页会变成纯黑，对比度过高(≈21:1)
+       * 久看刺眼。故在 body 之上再叠一层 mix-blend-mode:screen 的深灰提亮层，
+       * 把纯黑抬到 #1c1f24 左右的深灰（对比度降到 ≈15:1），白字仍为白。
+       * 注意 html 背景也要用同一深灰，否则边缘/过渡区会出现纯黑色带。 */
+      'html.td-theme-dark{background:' + DARK_LIFT_COLOR + ' !important;}',
       'html.td-theme-dark > body{filter:invert(1) hue-rotate(180deg) !important;}',
       // iframe / embed / object 整帧反色（doc/sheet 正文若渲染在 iframe 内也能覆盖）
       'html.td-theme-dark > body iframe,html.td-theme-dark > body embed,' +
@@ -551,10 +558,13 @@
       // 而父级白纸面被反成黑底 → 黑字黑底不可读（v1.6.1 踩坑修复）
       'html.td-theme-dark > body img,html.td-theme-dark > body video,' +
       'html.td-theme-dark > body picture{filter:invert(1) hue-rotate(180deg) !important;}',
+      // 深色提亮层：screen 混合，把纯黑抬成深灰（pointer-events:none 不影响交互）
+      'html.td-theme-dark #' + THEME_OVERLAY_ID + '{position:fixed;top:0;left:0;width:100%;height:100%;' +
+      'pointer-events:none;z-index:2147482000;background:' + DARK_LIFT_COLOR + ';mix-blend-mode:screen;}',
 
       /* ---- 护眼：豆沙绿 multiply 蒙层 ---- */
       'html.td-theme-sepia{background:' + SEPIA_COLOR + ' !important;}',
-      '#' + THEME_OVERLAY_ID + '{position:fixed;top:0;left:0;width:100%;height:100%;' +
+      'html.td-theme-sepia #' + THEME_OVERLAY_ID + '{position:fixed;top:0;left:0;width:100%;height:100%;' +
       'pointer-events:none;z-index:2147482000;background:' + SEPIA_COLOR + ';mix-blend-mode:multiply;}',
 
       /* ---- 深色模式下脚本自身 UI 同步换肤（挂在 html 下，不进 body 滤镜） ---- */
@@ -591,8 +601,10 @@
     html.classList.add('td-theme-' + t);
     ensureThemeStyle();
 
+    // 深色（screen 提亮层）与护眼（multiply 豆沙绿层）都需要蒙层；
+    // 同一容器按当前主题类切换混合模式与颜色，切到浅色时移除。
     var ov = document.getElementById(THEME_OVERLAY_ID);
-    if (t === 'sepia') {
+    if (t === 'dark' || t === 'sepia') {
       if (!ov) {
         ov = document.createElement('div');
         ov.id = THEME_OVERLAY_ID;
@@ -977,7 +989,7 @@
   /********************* 调试 / 测试钩子 *********************/
   try {
     window.__tdResize = {
-      version: '1.6.4',
+      version: '1.6.5',
       themes: THEME_ORDER.slice(),
       getTheme: getTheme,
       setTheme: function (t) { setTheme(t); },

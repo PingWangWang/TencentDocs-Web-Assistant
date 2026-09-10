@@ -2,7 +2,7 @@
 
 > 腾讯文档（docs.qq.com）网页端增强用户脚本：把「太窄、看不全」的左侧目录栏 / 大纲面板变成**可自由拖拽调宽**的面板，并保证正文内容同步让位、不被遮挡；附带可拖动的悬浮设置按钮与「自动关闭 AI 助手面板」开关。
 
-[![Version](https://img.shields.io/badge/version-1.6.4-blue)]()
+[![Version](https://img.shields.io/badge/version-1.6.5-blue)]()
 [![License](https://img.shields.io/badge/license-MIT-green)]()
 [![Tampermonkey](https://img.shields.io/badge/Tampermonkey-supported-orange)]()
 
@@ -78,10 +78,11 @@
 | 模式 | 实现方式 | 特点 |
 |------|----------|------|
 | **浅色** | 不注入任何滤镜 | 官方原貌，零副作用 |
-| **深色** | `body { filter: invert(1) hue-rotate(180deg) }` | 整站反色；`iframe / embed / object` 整帧反色（正文渲染在 iframe 内也能覆盖）；`img / video / picture` 再反向还原一次，照片头像不偏色（**canvas 与 svg 刻意不还原**：canvas 是 Word 正文 / Excel 表格的绘制层且背景透明，还原会黑字贴黑底；svg 还原后图标会变深色看不见）；`html` 背景同步置 `#14161a` 防漏白 |
+| **深色** | `body { filter: invert(1) hue-rotate(180deg) }` + `#1c1f24` 提亮蒙层（`mix-blend-mode: screen`） | 整站反色；**反色会把白底映射成纯黑，对比度过高且刺眼，故再叠一层 screen 深灰提亮层把纯黑抬到 `#1c1f24` 级深灰**（白字仍为白，对比度从 ≈21:1 降到 ≈15:1，观感更柔和）；`iframe / embed / object` 整帧反色（正文渲染在 iframe 内也能覆盖）；`img / video / picture` 再反向还原一次，照片头像不偏色（**canvas 与 svg 刻意不还原**：canvas 是 Word 正文 / Excel 表格的绘制层且背景透明，还原会黑字贴黑底；svg 还原后图标会变深色看不见）；`html` 背景同步置同款深灰防漏白 |
+| **护眼** | 顶层叠加 `#c7edcc` 豆沙绿蒙层（`mix-blend-mode: multiply`） | 白底 → 正豆沙绿、黑字仍为黑、蓝色链接仍偏蓝；比 `hue-rotate` 滤镜更自然，不会把蓝色转成紫红 |
 | **护眼** | 顶层叠加 `#c7edcc` 豆沙绿蒙层（`mix-blend-mode: multiply`） | 白底 → 正豆沙绿、黑字仍为黑、蓝色链接仍偏蓝；比 `hue-rotate` 滤镜更自然，不会把蓝色转成紫红 |
 
-**关键设计：** `filter` 会让所在元素变成 `position: fixed` 后代的包含块，导致 fixed 定位漂移。因此脚本自身 UI（齿轮 / 设置卡片 / 分隔条）统一挂在 `documentElement`（`body` 的兄弟节点），**不落入 body 滤镜范围** —— 既保持自身原色，也完全不受包含块变化影响，无需任何坐标补偿。护眼蒙层 `z-index` 为 `2147482000`，低于脚本 UI 的 `2147483000`，所以脚本 UI 不会被染绿。
+**关键设计：** `filter` 会让所在元素变成 `position: fixed` 后代的包含块，导致 fixed 定位漂移。因此脚本自身 UI（齿轮 / 设置卡片 / 分隔条）统一挂在 `documentElement`（`body` 的兄弟节点），**不落入 body 滤镜范围** —— 既保持自身原色，也完全不受包含块变化影响，无需任何坐标补偿。深色提亮层与护眼蒙层共用同一容器（`z-index` 为 `2147482000`，低于脚本 UI 的 `2147483000`），按当前主题类切换 `mix-blend-mode`（深色 `screen` / 护眼 `multiply`），脚本 UI 不会被着色。
 
 深色模式下脚本 UI 会同步换肤（深色卡片 + 深色齿轮），不会在暗色页面上出现刺眼的白块。
 
@@ -146,6 +147,7 @@ __tdResize.openSettings()     // 打开设置面板
 
 | 版本 | 主要内容 |
 |------|----------|
+| 1.6.5 | 优化深色模式观感：反色会把白底映射成纯黑，对比度过高、久看刺眼；新增 `#1c1f24` 深灰提亮蒙层（`mix-blend-mode: screen`）把纯黑抬到深灰，白字仍为白，对比度从 ≈21:1 降至 ≈15:1；`html` 背景同步改深灰防漏白；深色与护眼共用蒙层容器，按主题类切换混合模式 |
 | 1.6.4 | 设置面板点击外部自动收回：新增全屏透明遮罩（backdrop），面板打开时垫在页面内容（含 iframe）之上、齿轮/面板之下，点击任意处即关闭；修复 doc/sheet 正文渲染在 iframe 内时点击无法冒泡到父文档、导致面板不收回的问题 |
 | 1.6.3 | 新增 `docs.qq.com/sheet/*` 匹配：表格页此前脚本未注入（`@match` 缺 sheet），导致右下角齿轮不显示、主题不生效；现补齐匹配并让表格页跳过目录栏/大纲挂载（无对应侧栏），保留主题切换与 AI 面板开关 |
 | 1.6.2 | 文档页正文列**默认居中**：在「大纲右缘 ~ 滚动区右缘」可见区内水平居中，不再紧挨目录右侧、右侧不留大片空白；内容过宽放不下时退回防遮挡逻辑；`syncContentShift` 改用居中线为目标，沿用增量控制器收敛 |
