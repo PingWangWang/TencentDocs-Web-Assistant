@@ -1,0 +1,787 @@
+// ==UserScript==
+// @name         Tencent Docs Web Assistant — 腾讯文档Web助手
+// @namespace    https://github.com/PingWangWang
+// @version      1.5.1
+// @description  腾讯文档网页增强助手：①桌面版(desktop)左侧目录栏可拖拽调宽，内层目录自适应不截断文字；②文档页(doc)左侧大纲面板可拖拽调宽，正文内容同步右移不遮挡；③宽度自动记忆，双击分隔条恢复默认；④右下角齿轮悬浮按钮打开设置面板，可一键开关"自动关闭 AI 助手面板"，点击立即生效；齿轮可自由拖动摆放（位置自动记忆），避免遮挡内容。
+// @author       PingWangWang
+// @icon         https://docs.qq.com/favicon.ico
+// @match        https://docs.qq.com/desktop/*
+// @match        https://docs.qq.com/home*
+// @match        https://docs.qq.com/doc/*
+// @run-at       document-idle
+// @grant        GM_registerMenuCommand
+// @grant        GM_unregisterMenuCommand
+// @grant        GM_getValue
+// @grant        GM_setValue
+// @license      MIT
+// ==/UserScript==
+
+(function () {
+  'use strict';
+
+  /********************* 配置 *********************/
+  var KEY_DESKTOP_W = 'td_sidebar_width';      // desktop 目录栏宽度
+  var KEY_OUTLINE_W = 'td_outline_width';      // doc 大纲面板宽度
+  var KEY_GEAR_POS = 'td_gear_pos';            // 齿轮悬浮按钮位置 {x,y}
+  var SETTING_AI = 'td_auto_close_ai';
+  var GEAR_SIZE = 28;        // 齿轮按钮直径(px)
+  var GEAR_MARGIN = 16;      // 默认距视口边缘间距(px)
+  var GEAR_DRAG_THRESHOLD = 4; // 超过该位移(px)判定为拖动而非点击
+  var DEFAULT_WIDTH = 240;   // desktop 目录栏默认宽度
+  var OUTLINE_DEFAULT = 256; // doc 大纲默认宽度（实测内联 width:256px）
+  var MIN_WIDTH = 160;
+  var OUTLINE_MIN = 216;     // 官方 min-width:216px
+  var MAX_WIDTH = 560;
+  var OUTLINE_MAX = 600;
+  var HANDLE_W = 8;          // 分隔条命中区域宽度(px)
+  var CONTENT_GAP = 12;      // 大纲拉宽后与正文的保证间距(px)
+
+  /********************* 工具 *********************/
+  function $(sel, root) { return (root || document).querySelector(sel); }
+
+  /** 设置存储：优先 GM_*，无 Tampermonkey 环境时回退 localStorage */
+  var store = {
+    get: function (k) {
+      try { if (typeof GM_getValue === 'function') { var v = GM_getValue(k, null); if (v !== null && v !== undefined) return v; } } catch (e) {}
+      try { return localStorage.getItem(k); } catch (e) { return null; }
+    },
+    set: function (k, val) {
+      try { if (typeof GM_setValue === 'function') GM_setValue(k, val); } catch (e) {}
+      try { localStorage.setItem(k, String(val)); } catch (e) {}
+    },
+    del: function (k) {
+      try { if (typeof GM_setValue === 'function') GM_setValue(k, null); } catch (e) {}
+      try { localStorage.removeItem(k); } catch (e) {}
+    }
+  };
+
+  function clamp(w, min, max) { return Math.max(min, Math.min(max, w)); }
+
+  /********************* 设置项：自动关闭 AI 助手面板 *********************/
+  function getAutoCloseAi() { return store.get(SETTING_AI) === '1'; }
+  function setAutoCloseAi(on) { store.set(SETTING_AI, on ? '1' : '0'); refreshMenu(); }
+
+  var menuId = null;
+  function refreshMenu() {
+    var label = '⚙️ 设置：自动关闭右侧 AI 助手面板（当前：' + (getAutoCloseAi() ? '开启' : '关闭') + '）';
+    try {
+      if (typeof GM_registerMenuCommand !== 'function') return;
+      if (menuId !== null && typeof GM_unregisterMenuCommand === 'function') GM_unregisterMenuCommand(menuId);
+      menuId = GM_registerMenuCommand(label, function () {
+        applyAutoCloseAi(!getAutoCloseAi());
+      });
+    } catch (e) { /* 非油猴环境忽略 */ }
+  }
+
+  /********************* 分隔条 UI（桌面版 & 文档页共用） *********************/
+  var HANDLE_ID = 'td-sidebar-resize-handle';
+
+  function ensureHandleStyle() {
+    if ($('#' + HANDLE_ID + '-style')) return;
+    var css = [
+      // fixed 定位挂 body，避开容器 overflow:hidden 裁剪；rAF 持续贴齐目标右缘
+      '#' + HANDLE_ID + '{position:fixed;top:0;left:0;width:' + HANDLE_W + 'px;height:100px;' +
+        'cursor:col-resize;z-index:2147483647;user-select:none;-webkit-user-select:none;}',
+      '#' + HANDLE_ID + ' .td-rz-line{position:absolute;top:0;left:' + (HANDLE_W / 2 - 1) + 'px;width:2px;height:100%;' +
+        'background:transparent;transition:background .15s ease;}',
+      '#' + HANDLE_ID + ':hover .td-rz-line, #' + HANDLE_ID + '.td-rz-dragging .td-rz-line{background:#4e83fd;}',
+      'body.td-rz-noselect, body.td-rz-noselect *{user-select:none !important;-webkit-user-select:none !important;}',
+      'body.td-rz-noselect, body.td-rz-noselect *{cursor:col-resize !important;}'
+    ].join('\n');
+    var style = document.createElement('style');
+    style.id = HANDLE_ID + '-style';
+    style.textContent = css;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function createHandle() {
+    ensureHandleStyle();
+    var h = document.createElement('div');
+    h.id = HANDLE_ID;
+    h.innerHTML = '<div class="td-rz-line"></div>';
+    return h;
+  }
+
+  /** 让分隔条持续贴齐目标右缘（fixed 定位 + rAF 同步） */
+  function syncHandle(target, handle) {
+    var r = target.getBoundingClientRect();
+    var visible = r.width > 0 && r.height > 0;
+    handle.style.display = visible ? 'block' : 'none';
+    if (visible) {
+      handle.style.top = r.top + 'px';
+      handle.style.left = (r.right - HANDLE_W / 2) + 'px';
+      handle.style.height = r.height + 'px';
+    }
+  }
+
+  /**
+   * 通用拖动绑定。
+   * opts: { min, max, apply(w), commit(w), reset() }
+   * apply: 拖动过程中实时应用宽度；commit: 结束后保存；reset: 双击恢复默认
+   */
+  function attachDrag(target, handle, opts) {
+    var dragging = false;
+
+    handle.addEventListener('mousedown', function (e) {
+      if (e.button !== 0) return;
+      dragging = true;
+      e.preventDefault();
+      e.stopPropagation();
+      handle.classList.add('td-rz-dragging');
+      document.body.classList.add('td-rz-noselect');
+    });
+
+    document.addEventListener('mousemove', function (e) {
+      if (!dragging) return;
+      var rect = target.getBoundingClientRect();
+      var w = clamp(Math.round(e.clientX - rect.left), opts.min, opts.max);
+      opts.apply(w);
+      target.__tdLastW = w;
+    });
+
+    document.addEventListener('mouseup', function () {
+      if (!dragging) return;
+      dragging = false;
+      handle.classList.remove('td-rz-dragging');
+      document.body.classList.remove('td-rz-noselect');
+      var w = target.__tdLastW;
+      if (w == null) w = Math.round(target.getBoundingClientRect().width);
+      opts.commit(w);
+      try { window.dispatchEvent(new Event('resize')); } catch (e) {}
+    });
+
+    handle.addEventListener('dblclick', function (e) {
+      e.preventDefault();
+      opts.reset();
+      try { window.dispatchEvent(new Event('resize')); } catch (err) {}
+    });
+  }
+
+  /********************* 桌面版（/desktop）目录栏拖宽 *********************/
+  /**
+   * 定位左侧栏容器。腾讯文档把宽度写在 .desktop-layout-sidebar-pc
+   * 的内联 CSS 变量 --sidebar-width 上（实测默认 240px）。
+   * 做多级兜底，防止官方改类名导致脚本失效。
+   */
+  function findSidebar() {
+    var el = $('.desktop-layout-sidebar-pc');
+    if (el) return el;
+    el = document.querySelector('[style*="--sidebar-width"]');
+    if (el) return el;
+    var nav = $('nav.desktop-sidebar');
+    if (nav) {
+      var p = nav;
+      for (var i = 0; i < 3 && p.parentElement; i++) p = p.parentElement;
+      return p;
+    }
+    return null;
+  }
+
+  /********************* 宽度自适应修复（desktop） *********************/
+  /**
+   * Root cause：官方 CSS 把侧栏叶子层写死为适配 240px 的固定宽度
+   * （.rc-tree-treenode 224px / .desktop-sidebar-link 224px /
+   *   .rc-tree-node-content-wrapper 208px 等），拉宽 --sidebar-width
+   * 后外层全变宽，叶子层不动，导致文字被裁不显示。
+   */
+  var FIX_STYLE_ID = 'td-sidebar-width-fix-style';
+  function injectWidthFix() {
+    if ($('#' + FIX_STYLE_ID)) return;
+    var css = [
+      '.desktop-layout-sidebar-pc .rc-tree-treenode{width:100% !important;max-width:100% !important;min-width:0 !important;}',
+      '.desktop-layout-sidebar-pc .rc-tree-node-content-wrapper{flex:1 1 auto !important;width:auto !important;min-width:0 !important;max-width:100% !important;}',
+      '.desktop-layout-sidebar-pc .rc-tree-title{width:auto !important;max-width:100% !important;}',
+      '.desktop-layout-sidebar-pc .desktop-sidebar-route-link,' +
+      '.desktop-layout-sidebar-pc .desktop-sidebar-link,' +
+      '.desktop-layout-sidebar-pc .desktop-node-link{width:100% !important;max-width:100% !important;min-width:0 !important;box-sizing:border-box !important;}',
+      '.desktop-layout-sidebar-pc .desktop-storage-link-main{width:auto !important;max-width:100% !important;}',
+      '.desktop-layout-sidebar-pc .desktop-tree-nav-indicator{width:100% !important;}'
+    ].join('\n');
+    var style = document.createElement('style');
+    style.id = FIX_STYLE_ID;
+    style.textContent = css;
+    (document.head || document.documentElement).appendChild(style);
+  }
+
+  function applyDesktopWidth(sidebar, w) {
+    sidebar.style.setProperty('--sidebar-width', w + 'px');
+  }
+
+  function mountDesktop() {
+    if ($('#' + HANDLE_ID)) return true;
+    var sidebar = findSidebar();
+    if (!sidebar) return false;
+
+    injectWidthFix();
+
+    var saved = parseInt(store.get(KEY_DESKTOP_W), 10);
+    if (saved >= MIN_WIDTH && saved <= MAX_WIDTH) applyDesktopWidth(sidebar, saved);
+
+    var handle = createHandle();
+    attachDrag(sidebar, handle, {
+      min: MIN_WIDTH, max: MAX_WIDTH,
+      apply: function (w) { applyDesktopWidth(sidebar, w); },
+      commit: function (w) { store.set(KEY_DESKTOP_W, w); },
+      reset: function () {
+        applyDesktopWidth(sidebar, DEFAULT_WIDTH);
+        store.del(KEY_DESKTOP_W);
+      }
+    });
+    document.body.appendChild(handle);
+
+    var rafTimer = null;
+    var loop = function () {
+      if (!document.body.contains(handle) || !document.body.contains(sidebar)) {
+        cancelAnimationFrame(rafTimer);
+        if (handle.parentNode) handle.parentNode.removeChild(handle);
+        setTimeout(start, 1000);
+        return;
+      }
+      syncHandle(sidebar, handle);
+      rafTimer = requestAnimationFrame(loop);
+    };
+    rafTimer = requestAnimationFrame(loop);
+    return true;
+  }
+
+  /********************* 文档页（/doc）大纲面板拖宽 *********************/
+  /**
+   * 实测结构：大纲是绝对定位悬浮抽屉
+   *   .drawer_drawer-container (w:0) > .drawer_drawer__xxx.drawer_drawer-left__xxx
+   *   内联 width:256px; min-width:216px; max-width:332px
+   * 正文纸面（[class*="editor-wrapper"]）在 .editor-zone_editor-zone 滚动容器内
+   * margin:auto 居中，不随抽屉变宽移动 → 拉宽必须同时给滚动容器
+   * 补 padding-left（实验：padding 200px → 纸面右移 100px），保证
+   * 纸面左缘 ≥ 抽屉右缘 + CONTENT_GAP，避免遮挡。
+   */
+  function findOutlineDrawer() {
+    var d = document.querySelector('[class*="drawer_drawer__"][class*="drawer_drawer-left"]');
+    if (d && d.getBoundingClientRect().width > 50) return d;
+    // 兜底：从「大纲」文本向上找绝对定位窄面板
+    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    var n;
+    while ((n = walker.nextNode())) {
+      if ((n.textContent || '').trim() === '大纲' && n.parentElement) {
+        var el = n.parentElement;
+        for (var i = 0; i < 10 && el; i++) {
+          var r = el.getBoundingClientRect();
+          var cs = getComputedStyle(el);
+          if (cs.position === 'absolute' && r.width >= 120 && r.width <= 400 && r.left < 100) return el;
+          el = el.parentElement;
+        }
+      }
+    }
+    return null;
+  }
+
+  function findEditorScroller() {
+    return document.querySelector('[class*="editor-zone_editor-zone"]');
+  }
+
+  function findPaper() {
+    return document.querySelector('[class*="editor-wrapper"]') ||
+           document.querySelector('[class*="melo-doc-view"]');
+  }
+
+  /** 让正文纸面右移，保证不与拉宽后的大纲重叠（tick 内每帧自校正） */
+  function syncContentShift(drawer) {
+    var scroller = findEditorScroller();
+    var paper = findPaper();
+    if (!scroller || !paper) return;
+    var dr = drawer.getBoundingClientRect();
+    var pr = paper.getBoundingClientRect();
+    if (dr.width === 0 || pr.width === 0) return;
+    var need = dr.right + CONTENT_GAP - pr.x;      // >0 表示需要右移
+    if (Math.abs(need) <= 2) return;               // 死区防抖
+    // 增量控制，增益 1：pad_new = cur + need。实测 padding→纸面位移系数
+    // 在 0.5~1 之间（不同布局状态下不同），增益 1 对任意 0<s<=1 都单调收敛；
+    // 增益 2 在 s=1 时（实站）会陷入 ±2*need 的周期振荡（实测踩坑）
+    var cur = parseInt(scroller.style.getPropertyValue('padding-left'), 10) || 0;
+    var pad = Math.max(0, Math.min(1200, Math.round(cur + need)));
+    if (pad !== cur) scroller.style.setProperty('padding-left', pad + 'px', 'important');
+  }
+
+  function applyOutlineWidth(drawer, w) {
+    drawer.style.setProperty('width', w + 'px', 'important');
+    drawer.style.setProperty('max-width', 'none', 'important'); // 解除官方 max-width:332px 封顶
+  }
+
+  var docState = { curW: null, started: false, timer: null };
+
+  function getSavedOutlineW() {
+    var v = parseInt(store.get(KEY_OUTLINE_W), 10);
+    return (v >= OUTLINE_MIN && v <= OUTLINE_MAX) ? v : OUTLINE_DEFAULT;
+  }
+
+  /**
+   * 文档页采用无状态 tick 架构：官方 React 重渲染会重建抽屉/滚动容器
+   * 节点并重置内联样式（实测导致闭包 rAF 循环持旧引用失效），
+   * 因此每 tick 重新查询现势节点，把宽度与正文偏移重新施加，
+   * 节点被重建后 150ms 内自愈。
+   */
+  function mountDocOutline() {
+    if (docState.started) return true;
+    var drawer = findOutlineDrawer();
+    if (!drawer) return false;
+    docState.started = true;
+    if (docState.curW == null) docState.curW = getSavedOutlineW();
+
+    // 代理目标：每次拖动实时解析现势抽屉节点（防拖拽中途被 React 重建）
+    var proxy = {
+      getBoundingClientRect: function () {
+        var d = findOutlineDrawer();
+        if (d) return d.getBoundingClientRect();
+        return { left: 0, top: 0, right: 0, bottom: 0, width: 0, height: 0, x: 0, y: 0 };
+      }
+    };
+
+    var handle = createHandle();
+    attachDrag(proxy, handle, {
+      min: OUTLINE_MIN, max: OUTLINE_MAX,
+      apply: function (w) { docState.curW = w; docTick(); },
+      commit: function (w) { store.set(KEY_OUTLINE_W, w); },
+      reset: function () {
+        docState.curW = OUTLINE_DEFAULT;
+        store.del(KEY_OUTLINE_W);
+        docTick();
+      }
+    });
+    document.body.appendChild(handle);
+
+    function docTick() {
+      var d = findOutlineDrawer();
+      if (!d) return;
+      // 官方重渲染会重置内联宽度 → 每 tick 强制对齐宽度真值
+      if (parseInt(d.style.width, 10) !== docState.curW) applyOutlineWidth(d, docState.curW);
+      syncHandle(d, handle);
+      syncContentShift(d);
+      if (!document.body.contains(handle)) {
+        document.body.appendChild(handle); // handle 被清理时自动补挂
+      }
+    }
+    docTick();
+    docState.timer = setInterval(docTick, 150);
+    return true;
+  }
+
+  /********************* AI 助手面板自动关闭 *********************/
+  var aiHiddenByUs = [];  // 记录被我们 display:none 的面板，关闭设置后恢复
+  var lastAiCloseAt = 0;
+
+  /** 在页面内找"AI助手"面板根：右侧、有宽度的容器 */
+  function findAiPanel() {
+    var walker = document.createTreeWalker(document.body, NodeFilter.SHOW_TEXT);
+    var n;
+    while ((n = walker.nextNode())) {
+      var t = (n.textContent || '').trim();
+      if (t !== 'AI助手') continue;
+      var el = n.parentElement;
+      if (!el) continue;
+      var r = el.getBoundingClientRect();
+      if (r.left < window.innerWidth * 0.5) continue; // 需在屏幕右半侧
+      var root = el, rootRect;
+      for (var i = 0; i < 8 && root; i++) {
+        rootRect = root.getBoundingClientRect();
+        if (rootRect.width >= 250 && rootRect.width <= 800 &&
+            rootRect.right >= window.innerWidth - 12 && rootRect.height > 200) {
+          return root;
+        }
+        root = root.parentElement;
+      }
+    }
+    return null;
+  }
+
+  /** 关闭 AI 面板：多策略（关闭按钮 → 入口按钮切换 → display:none 兜底） */
+  function aiCloseTick(force) {
+    if (!force && !getAutoCloseAi()) return;
+    var now = Date.now();
+    if (now - lastAiCloseAt < 800) return;
+
+    var topBar = document.querySelector('.desktop-top-bar-right.with-ai-panel');
+    var panel = findAiPanel();
+    if (!topBar && !panel) return;
+
+    lastAiCloseAt = now;
+
+    if (panel) {
+      var sel = ['button', '[role="button"]', '.docs-icon', '[class*="close"]', 'svg', 'i'];
+      for (var s = 0; s < sel.length; s++) {
+        var els = panel.querySelectorAll(sel[s]);
+        var best = null;
+        for (var i = 0; i < els.length; i++) {
+          var r = els[i].getBoundingClientRect();
+          if (r.width === 0 || r.height === 0) continue;
+          if (r.top <= panel.getBoundingClientRect().top + 64 && r.right >= panel.getBoundingClientRect().right - 90) {
+            if (!best || r.right > best.getBoundingClientRect().right) best = els[i];
+          }
+        }
+        if (best) {
+          best.click();
+          setTimeout(function () {
+            if (getAutoCloseAi() && (document.querySelector('.desktop-top-bar-right.with-ai-panel') || findAiPanel())) {
+              tryEntryToggle();
+            }
+          }, 500);
+          return;
+        }
+      }
+    }
+    tryEntryToggle();
+  }
+
+  /** 策略2：点击顶栏 AI 入口按钮切换面板 */
+  function tryEntryToggle() {
+    var btn = document.querySelector('.desktop-ai-entry-button');
+    if (btn) { btn.click(); }
+    setTimeout(function () {
+      if (!getAutoCloseAi()) return;
+      var p = findAiPanel();
+      if (p && p.getBoundingClientRect().width > 0) {
+        p.__tdAiHidden = true;
+        aiHiddenByUs.push(p);
+        p.style.setProperty('display', 'none', 'important');
+      } else if (document.querySelector('.desktop-top-bar-right.with-ai-panel')) {
+        var tb = document.querySelector('.desktop-top-bar-right.with-ai-panel');
+        tb.classList.remove('with-ai-panel');
+        tb.__tdAiClassRemoved = true;
+        aiHiddenByUs.push(tb);
+      }
+    }, 500);
+  }
+
+  /** 关闭设置被关掉时，恢复我们隐藏的面板 */
+  function restoreAiPanels() {
+    while (aiHiddenByUs.length) {
+      var el = aiHiddenByUs.pop();
+      if (el.__tdAiHidden) { el.style.removeProperty('display'); el.__tdAiHidden = false; }
+      if (el.__tdAiClassRemoved) { el.classList.add('with-ai-panel'); el.__tdAiClassRemoved = false; }
+    }
+  }
+
+  var aiTimer = null;
+  function startAiWatcher() {
+    if (aiTimer) return;
+    aiTimer = setInterval(function () {
+      if (getAutoCloseAi()) aiCloseTick(false);
+    }, 1000);
+  }
+
+  /********************* 设置面板 UI（齿轮按钮 + 弹出卡片） *********************/
+  var GEAR_ID = 'td-rz-gear';
+  var PANEL_ID = 'td-rz-settings';
+
+  /** 开关切换：立即生效 */
+  function applyAutoCloseAi(on) {
+    setAutoCloseAi(on);            // 持久化 + 刷新油猴菜单
+    if (on) aiCloseTick(true);     // 开：立即关一轮面板
+    else restoreAiPanels();        // 关：恢复被隐藏的面板
+  }
+
+  /********************* 齿轮位置：默认右下角 + 可拖动 + 记忆 *********************/
+  /** 默认位置：视口右下角 */
+  function defaultGearPos() {
+    return {
+      x: Math.max(4, window.innerWidth - GEAR_SIZE - GEAR_MARGIN),
+      y: Math.max(4, window.innerHeight - GEAR_SIZE - GEAR_MARGIN)
+    };
+  }
+
+  /** 钳制在视口内（窗口缩放/分辨率变化后仍可见） */
+  function clampGearPos(p) {
+    var maxX = Math.max(4, window.innerWidth - GEAR_SIZE - 4);
+    var maxY = Math.max(4, window.innerHeight - GEAR_SIZE - 4);
+    return { x: Math.max(4, Math.min(Math.round(p.x), maxX)),
+             y: Math.max(4, Math.min(Math.round(p.y), maxY)) };
+  }
+
+  function loadGearPos() {
+    var raw = store.get(KEY_GEAR_POS);
+    if (raw) {
+      try {
+        var p = typeof raw === 'string' ? JSON.parse(raw) : raw;
+        if (p && typeof p.x === 'number' && typeof p.y === 'number') return clampGearPos(p);
+      } catch (e) {}
+    }
+    return clampGearPos(defaultGearPos());
+  }
+
+  function saveGearPos(p) { store.set(KEY_GEAR_POS, JSON.stringify(p)); }
+
+  function applyGearPos(gear, p) {
+    gear.style.left = p.x + 'px';
+    gear.style.top = p.y + 'px';
+  }
+
+  /** 设置面板跟随齿轮：优先放上方，空间不足改下方；水平右对齐且不出屏 */
+  function positionPanel(gear, panel) {
+    var gr = gear.getBoundingClientRect();
+    var pw = panel.offsetWidth || 264;
+    var ph = panel.offsetHeight || 220;
+    var vw = window.innerWidth, vh = window.innerHeight;
+
+    var left = gr.right - pw;                       // 与齿轮右对齐
+    left = Math.max(8, Math.min(left, vw - pw - 8));
+
+    var top = gr.top - ph - 8;                      // 优先上方
+    if (top < 8) top = gr.bottom + 8;               // 上方放不下改下方
+    top = Math.max(8, Math.min(top, vh - ph - 8));
+
+    panel.style.left = Math.round(left) + 'px';
+    panel.style.top = Math.round(top) + 'px';
+  }
+
+  function createSettingsUi() {
+    if ($('#' + GEAR_ID)) return;
+
+    var css = [
+      '#' + GEAR_ID + '{position:fixed;width:' + GEAR_SIZE + 'px;height:' + GEAR_SIZE + 'px;border-radius:50%;' +
+        'background:rgba(255,255,255,.9);border:1px solid #e0e3e8;box-shadow:0 1px 4px rgba(0,0,0,.12);' +
+        'cursor:grab;z-index:2147483000;display:flex;align-items:center;justify-content:center;' +
+        'box-sizing:border-box;transition:transform .15s ease, box-shadow .15s ease;padding:0;}',
+      '#' + GEAR_ID + ':hover{transform:rotate(40deg) scale(1.08);box-shadow:0 2px 8px rgba(0,0,0,.2);}',
+      // 拖动中：覆盖 hover 的旋转，改用 grabbing 光标（同特异性靠后定义生效）
+      '#' + GEAR_ID + '.td-rz-gear-dragging{cursor:grabbing !important;transition:none;' +
+        'transform:scale(1.12);box-shadow:0 4px 14px rgba(0,0,0,.28);opacity:.95;}',
+      '#' + GEAR_ID + ' svg{width:16px;height:16px;fill:#5f6672;pointer-events:none;}',
+      'body.td-rz-gear-move,body.td-rz-gear-move *{user-select:none !important;' +
+        '-webkit-user-select:none !important;cursor:grabbing !important;}',
+      '#' + PANEL_ID + '{position:fixed;width:264px;background:#fff;border-radius:12px;' +
+        'box-shadow:0 6px 24px rgba(0,0,0,.16);border:1px solid #eceef1;z-index:2147483001;' +
+        'font-size:13px;color:#333;overflow:hidden;display:none;user-select:none;-webkit-user-select:none;}',
+      '#' + PANEL_ID + '.td-rz-open{display:block;}',
+      '#' + PANEL_ID + ' .td-rz-title{padding:12px 14px 8px;font-weight:600;font-size:13px;color:#1f2329;}',
+      '#' + PANEL_ID + ' .td-rz-row{display:flex;align-items:center;justify-content:space-between;' +
+        'padding:10px 14px;cursor:pointer;transition:background .12s ease;}',
+      '#' + PANEL_ID + ' .td-rz-row:hover{background:#f5f6f8;}',
+      '#' + PANEL_ID + ' .td-rz-row .td-rz-label{color:#333;}',
+      '#' + PANEL_ID + ' .td-rz-switch{position:relative;width:36px;height:20px;border-radius:10px;' +
+        'background:#d5d9e0;transition:background .18s ease;flex-shrink:0;margin-left:8px;}',
+      '#' + PANEL_ID + ' .td-rz-switch::after{content:"";position:absolute;top:2px;left:2px;width:16px;height:16px;' +
+        'border-radius:50%;background:#fff;box-shadow:0 1px 3px rgba(0,0,0,.25);transition:left .18s ease;}',
+      '#' + PANEL_ID + ' .td-rz-switch.td-rz-on{background:#4e83fd;}',
+      '#' + PANEL_ID + ' .td-rz-switch.td-rz-on::after{left:18px;}',
+      '#' + PANEL_ID + ' .td-rz-divider{height:1px;background:#f0f1f4;margin:0 14px;}',
+      '#' + PANEL_ID + ' .td-rz-footer{padding:8px 14px 12px;color:#9aa1ac;font-size:12px;line-height:1.6;}'
+    ].join('\n');
+    var style = document.createElement('style');
+    style.id = GEAR_ID + '-style';
+    style.textContent = css;
+    (document.head || document.documentElement).appendChild(style);
+
+    var gear = document.createElement('button');
+    gear.id = GEAR_ID;
+    gear.type = 'button';
+    gear.title = '侧栏助手设置';
+    gear.innerHTML =
+      '<svg viewBox="0 0 24 24"><path d="M19.14 12.94a7.07 7.07 0 0 0 .06-.94 7.07 7.07 0 0 0-.06-.94l2.03-1.58a.5.5 0 0 0 .12-.64l-1.92-3.32a.5.5 0 0 0-.61-.22l-2.39.96a7.3 7.3 0 0 0-1.62-.94l-.36-2.54A.5.5 0 0 0 13.9 2h-3.8a.5.5 0 0 0-.49.42l-.36 2.54c-.59.24-1.13.56-1.62.94l-2.39-.96a.5.5 0 0 0-.61.22L2.71 8.48a.5.5 0 0 0 .12.64l2.03 1.58c-.04.31-.06.62-.06.94 0 .32.02.63.06.94l-2.03 1.58a.5.5 0 0 0-.12.64l1.92 3.32c.14.24.42.34.61.22l2.39-.96c.49.38 1.03.7 1.62.94l.36 2.54c.04.24.25.42.49.42h3.8c.24 0 .45-.18.49-.42l.36-2.54c.59-.24 1.13-.56 1.62-.94l2.39.96c.23.09.47 0 .61-.22l1.92-3.32a.5.5 0 0 0-.12-.64l-2.03-1.58zM12 15.5A3.5 3.5 0 1 1 12 8.5a3.5 3.5 0 0 1 0 7z"/></svg>';
+
+    var panel = document.createElement('div');
+    panel.id = PANEL_ID;
+    panel.innerHTML =
+      '<div class="td-rz-title">侧栏助手设置</div>' +
+      '<div class="td-rz-row" id="td-rz-row-ai">' +
+      '  <span class="td-rz-label">自动关闭 AI 助手面板</span>' +
+      '  <span class="td-rz-switch" id="td-rz-switch-ai"></span>' +
+      '</div>' +
+      '<div class="td-rz-divider"></div>' +
+      '<div class="td-rz-row" id="td-rz-row-reset">' +
+      '  <span class="td-rz-label" style="color:#4e83fd;">恢复默认侧栏宽度</span>' +
+      '</div>' +
+      '<div class="td-rz-row" id="td-rz-row-gearpos">' +
+      '  <span class="td-rz-label" style="color:#4e83fd;">悬浮按钮回到右下角</span>' +
+      '</div>' +
+      '<div class="td-rz-footer">拖动侧栏/大纲右边缘调宽 · 双击分隔线也可重置<br>' +
+      '齿轮可自由拖动摆放（位置自动记忆）· 右键齿轮立即复位<br>设置即时生效并自动保存</div>';
+
+    gear.title = '侧栏助手设置（可拖动摆放 · 右键立即复位）';
+    document.body.appendChild(gear);
+    document.body.appendChild(panel);
+
+    // 初始位置：右下角（有记忆则用记忆位置）
+    var gearPos = loadGearPos();
+    applyGearPos(gear, gearPos);
+
+    var sw = panel.querySelector('#td-rz-switch-ai');
+    function renderSwitch() { sw.classList.toggle('td-rz-on', getAutoCloseAi()); }
+    renderSwitch();
+
+    function openPanel() {
+      panel.classList.add('td-rz-open');
+      renderSwitch();
+      positionPanel(gear, panel);
+    }
+    function closePanel() { panel.classList.remove('td-rz-open'); }
+
+    /*** 拖动摆放：位移超过阈值才算拖动，否则仍视为点击 ***/
+    var gDrag = { active: false, moved: false, sx: 0, sy: 0, ox: 0, oy: 0 };
+
+    gear.addEventListener('mousedown', function (e) {
+      if (e.button !== 0) return;
+      gDrag.active = true;
+      gDrag.moved = false;
+      gDrag.sx = e.clientX;
+      gDrag.sy = e.clientY;
+      gDrag.ox = parseFloat(gear.style.left) || 0;
+      gDrag.oy = parseFloat(gear.style.top) || 0;
+      e.preventDefault();   // 防止拖出文本选区
+      e.stopPropagation();
+    });
+
+    document.addEventListener('mousemove', function (e) {
+      if (!gDrag.active) return;
+      var dx = e.clientX - gDrag.sx, dy = e.clientY - gDrag.sy;
+      if (!gDrag.moved) {
+        if (Math.abs(dx) + Math.abs(dy) <= GEAR_DRAG_THRESHOLD) return;
+        gDrag.moved = true;
+        gear.classList.add('td-rz-gear-dragging');
+        document.body.classList.add('td-rz-gear-move');
+      }
+      var p = clampGearPos({ x: gDrag.ox + dx, y: gDrag.oy + dy });
+      applyGearPos(gear, p);
+      if (panel.classList.contains('td-rz-open')) positionPanel(gear, panel);
+    });
+
+    document.addEventListener('mouseup', function () {
+      if (!gDrag.active) return;
+      gDrag.active = false;
+      gear.classList.remove('td-rz-gear-dragging');
+      document.body.classList.remove('td-rz-gear-move');
+      if (gDrag.moved) {
+        saveGearPos({ x: parseFloat(gear.style.left) || 0, y: parseFloat(gear.style.top) || 0 });
+      }
+      // moved 留给随后的 click 事件判断，click 结束后在下一帧清零
+      setTimeout(function () { gDrag.moved = false; }, 0);
+    });
+
+    // 右键：立即复位到右下角
+    gear.addEventListener('contextmenu', function (e) {
+      e.preventDefault();
+      e.stopPropagation();
+      var p = clampGearPos(defaultGearPos());
+      applyGearPos(gear, p);
+      saveGearPos(p);
+      if (panel.classList.contains('td-rz-open')) positionPanel(gear, panel);
+    });
+
+    gear.addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (gDrag.moved) return;   // 刚才是在拖动，不触发开合
+      panel.classList.contains('td-rz-open') ? closePanel() : openPanel();
+    });
+
+    panel.querySelector('#td-rz-row-ai').addEventListener('click', function (e) {
+      e.stopPropagation();
+      applyAutoCloseAi(!getAutoCloseAi());
+      renderSwitch();
+    });
+
+    // 恢复默认宽度（按当前页面类型分流）
+    panel.querySelector('#td-rz-row-reset').addEventListener('click', function (e) {
+      e.stopPropagation();
+      if (isDocPage()) {
+        var drawer = findOutlineDrawer();
+        if (drawer) {
+          drawer.style.setProperty('width', OUTLINE_DEFAULT + 'px', 'important');
+          drawer.style.removeProperty('max-width');
+          store.del(KEY_OUTLINE_W);
+          syncContentShift(drawer);
+        }
+      } else {
+        var sb = findSidebar();
+        if (sb) {
+          sb.style.setProperty('--sidebar-width', DEFAULT_WIDTH + 'px');
+          store.del(KEY_DESKTOP_W);
+        }
+      }
+      try { window.dispatchEvent(new Event('resize')); } catch (err) {}
+      closePanel();
+    });
+
+    // 悬浮按钮复位到右下角
+    panel.querySelector('#td-rz-row-gearpos').addEventListener('click', function (e) {
+      e.stopPropagation();
+      var p = clampGearPos(defaultGearPos());
+      applyGearPos(gear, p);
+      saveGearPos(p);
+      positionPanel(gear, panel);
+    });
+
+    // 窗口尺寸变化：保证齿轮仍在视口内，面板重新贴齐
+    window.addEventListener('resize', function () {
+      var p = clampGearPos({
+        x: parseFloat(gear.style.left) || 0,
+        y: parseFloat(gear.style.top) || 0
+      });
+      applyGearPos(gear, p);
+      if (panel.classList.contains('td-rz-open')) positionPanel(gear, panel);
+    });
+
+    document.addEventListener('mousedown', function (e) {
+      if (!panel.classList.contains('td-rz-open')) return;
+      if (panel.contains(e.target) || e.target === gear || gear.contains(e.target)) return;
+      closePanel();
+    });
+    document.addEventListener('keydown', function (e) {
+      if (e.key === 'Escape') closePanel();
+    });
+
+    panel.__renderSwitch = renderSwitch;
+  }
+
+  /** 外部（油猴菜单）切换后同步卡片开关状态 */
+  var _origSetAutoCloseAi = setAutoCloseAi;
+  setAutoCloseAi = function (on) {
+    _origSetAutoCloseAi(on);
+    var panel = $('#' + PANEL_ID);
+    if (panel && panel.__renderSwitch) panel.__renderSwitch();
+  };
+
+  /********************* 初始化 + SPA 监听 *********************/
+  function isDocPage() { return /^\/doc\//.test(location.pathname); }
+
+  function mount() {
+    if ($('#' + HANDLE_ID)) return true;
+    return isDocPage() ? mountDocOutline() : mountDesktop();
+  }
+
+  function start() {
+    if (mount()) return;
+    // SPA 首屏异步渲染：轮询 + MutationObserver 双保险
+    var timer = setInterval(function () {
+      if (mount()) { clearInterval(timer); observer.disconnect(); }
+    }, 500);
+    var observer = new MutationObserver(function () {
+      if (mount()) { clearInterval(timer); observer.disconnect(); }
+    });
+    observer.observe(document.documentElement, { childList: true, subtree: true });
+    // 15 秒后仍未找到目标面板则停止观察（未登录跳转等场景）
+    setTimeout(function () { clearInterval(timer); observer.disconnect(); }, 15000);
+  }
+
+  function startAll() {
+    start();
+    refreshMenu();
+    createSettingsUi();
+    if (getAutoCloseAi()) aiCloseTick(true);
+    startAiWatcher();
+  }
+
+  /********************* 调试 / 测试钩子 *********************/
+  try {
+    window.__tdResize = {
+      version: '1.5.1',
+      getAutoCloseAi: getAutoCloseAi,
+      setAutoCloseAi: function (on) { setAutoCloseAi(!!on); if (on) aiCloseTick(true); else restoreAiPanels(); },
+      closeAiNow: function () { aiCloseTick(true); },
+      restoreAi: restoreAiPanels,
+      openSettings: function () { var g = $('#' + GEAR_ID); if (g) g.click(); },
+      findOutlineDrawer: findOutlineDrawer,
+      syncContentShift: function () { var d = findOutlineDrawer(); if (d) syncContentShift(d); },
+      getGearPos: function () { var g = $('#' + GEAR_ID); return g ? { x: parseFloat(g.style.left), y: parseFloat(g.style.top) } : null; },
+      resetGearPos: function () { var g = $('#' + GEAR_ID); if (!g) return; var p = clampGearPos(defaultGearPos()); applyGearPos(g, p); saveGearPos(p); }
+    };
+  } catch (e) {}
+
+  startAll();
+})();
