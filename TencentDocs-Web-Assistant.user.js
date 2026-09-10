@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         Tencent Docs Web Assistant — 腾讯文档Web助手
 // @namespace    https://github.com/PingWangWang
-// @version      1.6.3
+// @version      1.6.4
 // @description  腾讯文档网页增强助手：①桌面版(desktop)左侧目录栏可拖拽调宽，内层目录自适应不截断文字；②文档页(doc)左侧大纲面板可拖拽调宽，正文内容同步右移不遮挡；③宽度自动记忆，双击分隔条恢复默认；④右下角齿轮悬浮按钮打开设置面板，可一键开关"自动关闭 AI 助手面板"，点击立即生效；齿轮可自由拖动摆放（位置自动记忆），避免遮挡内容；⑤主题切换：浅色/深色/护眼（豆沙绿）三档，即时生效并记忆。
 // @author       PingWangWang
 // @icon         https://docs.qq.com/favicon.ico
@@ -606,6 +606,7 @@
   /********************* 设置面板 UI（齿轮按钮 + 弹出卡片） *********************/
   var GEAR_ID = 'td-rz-gear';
   var PANEL_ID = 'td-rz-settings';
+  var MASK_ID = 'td-rz-mask';   // 全屏透明遮罩：面板打开时拦截页面/iframe 点击用于关闭
 
   /** 开关切换：立即生效 */
   function applyAutoCloseAi(on) {
@@ -709,7 +710,11 @@
       '#' + PANEL_ID + ' .td-rz-seg-btn + .td-rz-seg-btn{border-left:1px solid #e3e6ea;}',
       '#' + PANEL_ID + ' .td-rz-seg-btn:hover{background:#f2f4f7;}',
       '#' + PANEL_ID + ' .td-rz-seg-btn.td-rz-seg-on{background:#4e83fd;color:#fff;}',
-      '#' + PANEL_ID + ' .td-rz-seg-btn.td-rz-seg-on:hover{background:#4e83fd;}'
+      '#' + PANEL_ID + ' .td-rz-seg-btn.td-rz-seg-on:hover{background:#4e83fd;}',
+      /* 全屏透明遮罩：低于齿轮(2147483000)与面板(2147483001)，高于页面内容(含 iframe) */
+      '#' + MASK_ID + '{position:fixed;inset:0;z-index:2147482999;display:none;background:transparent;' +
+        'border:0;padding:0;margin:0;cursor:default;}',
+      '#' + MASK_ID + '.td-rz-open{display:block;}'
     ].join('\n');
     var style = document.createElement('style');
     style.id = GEAR_ID + '-style';
@@ -755,6 +760,11 @@
     document.documentElement.appendChild(gear);
     document.documentElement.appendChild(panel);
 
+    // 全屏透明遮罩：面板打开时垫在面板/齿轮之下、页面内容之上，点击任意处关闭
+    var mask = document.createElement('div');
+    mask.id = MASK_ID;
+    document.documentElement.appendChild(mask);
+
     // 初始位置：右下角（有记忆则用记忆位置）
     var gearPos = loadGearPos();
     applyGearPos(gear, gearPos);
@@ -785,11 +795,15 @@
 
     function openPanel() {
       panel.classList.add('td-rz-open');
+      mask.classList.add('td-rz-open');
       renderSwitch();
       renderTheme();
       positionPanel(gear, panel);
     }
-    function closePanel() { panel.classList.remove('td-rz-open'); }
+    function closePanel() {
+      panel.classList.remove('td-rz-open');
+      mask.classList.remove('td-rz-open');
+    }
 
     /*** 拖动摆放：位移超过阈值才算拖动，否则仍视为点击 ***/
     var gDrag = { active: false, moved: false, sx: 0, sy: 0, ox: 0, oy: 0 };
@@ -895,9 +909,11 @@
       if (panel.classList.contains('td-rz-open')) positionPanel(gear, panel);
     });
 
-    document.addEventListener('mousedown', function (e) {
-      if (!panel.classList.contains('td-rz-open')) return;
-      if (panel.contains(e.target) || e.target === gear || gear.contains(e.target)) return;
+    // 点击页面任意处（含 iframe 上方）→ 关闭面板。
+    // 遮罩 z-index 低于齿轮/面板、高于页面内容，故点击齿轮/面板不会落到遮罩上；
+    // 点击正文/表格（即使渲染在 iframe 内）也会被遮罩拦截并触发关闭。
+    mask.addEventListener('mousedown', function (e) {
+      e.stopPropagation();
       closePanel();
     });
     document.addEventListener('keydown', function (e) {
@@ -961,7 +977,7 @@
   /********************* 调试 / 测试钩子 *********************/
   try {
     window.__tdResize = {
-      version: '1.6.3',
+      version: '1.6.4',
       themes: THEME_ORDER.slice(),
       getTheme: getTheme,
       setTheme: function (t) { setTheme(t); },
